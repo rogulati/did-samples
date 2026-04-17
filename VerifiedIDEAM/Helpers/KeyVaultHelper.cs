@@ -15,26 +15,43 @@ using System.Security.Cryptography.X509Certificates;
 namespace VerifiedIDEAM.Helpers {
     public class KeyVaultHelper {
 
-        public static X509Certificate2 GetKeyVaultX509Certificate( IConfiguration configuration, out string certName, out string certVersion ) {
+        /// <summary>
+        /// Gets the RSA public key parameters from Key Vault using KeyClient (no certificate download needed).
+        /// Works on Free/Shared App Service plans.
+        /// </summary>
+        public static KeyVaultKey GetKeyVaultPublicKey( IConfiguration configuration, out string signingKeyName, out string signingKeyVersion ) {
             ClientSecretCredential clientSecretCredential = new ClientSecretCredential( configuration["AzureAd:TenantId"]
                                                                                         , configuration["AzureAd:ClientId"]
                                                                                         , configuration["AzureAd:ClientSecret"]
                                                                                       );
+            string keyIdentifier = configuration["AppSettings:KeyIdentifier"];
+            string[] parts = keyIdentifier.Split( "/" );
+            string keyVaultURI = $"{parts[0]}//{parts[2]}";
+            signingKeyName = parts[4];
+            signingKeyVersion = parts[5];
+            var keyClient = new KeyClient( new System.Uri( keyVaultURI ), clientSecretCredential );
+            KeyVaultKey key = keyClient.GetKey( signingKeyName, signingKeyVersion );
+            return key;
+        }
+
+        /// <summary>
+        /// Gets the public certificate (CER) from Key Vault — only the public portion, no private key.
+        /// Works on Free/Shared plans since no private key is loaded.
+        /// </summary>
+        public static byte[] GetPublicCertificate( IConfiguration configuration ) {
             string certIdentifier = configuration["AppSettings:CertificateIdentifier"];
+            if (string.IsNullOrEmpty( certIdentifier )) return null;
+            ClientSecretCredential clientSecretCredential = new ClientSecretCredential( configuration["AzureAd:TenantId"]
+                                                                                        , configuration["AzureAd:ClientId"]
+                                                                                        , configuration["AzureAd:ClientSecret"]
+                                                                                      );
             string[] parts = certIdentifier.Split( "/" );
             string keyVaultURI = $"{parts[0]}//{parts[2]}";
-            certName = parts[4];
-            certVersion = parts[5];
+            string certName = parts[4];
             Uri kvURI = new Uri( keyVaultURI );
             CertificateClient certClient = new CertificateClient( vaultUri: kvURI, credential: clientSecretCredential );
             KeyVaultCertificateWithPolicy cert = certClient.GetCertificate( certName );
-
-            var secretClient = new SecretClient( kvURI, clientSecretCredential );
-            KeyVaultSecretIdentifier secredIdentifier = new KeyVaultSecretIdentifier( cert.SecretId );
-            KeyVaultSecret secret = secretClient.GetSecret( secredIdentifier.Name, secredIdentifier.Version );
-            byte[] privateKeyBytes = Convert.FromBase64String( secret.Value );
-            var x509cert = new X509Certificate2( privateKeyBytes, configuration["OIDC:CertificatePassword"], X509KeyStorageFlags.UserKeySet );
-            return x509cert;
+            return cert.Cer; // public cert only — no private key
         }
 
         private static CryptographyClient GetKeyVaultClient( IConfiguration configuration, out string signingKeyVersion ) {

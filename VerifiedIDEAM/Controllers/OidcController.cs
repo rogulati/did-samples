@@ -86,19 +86,15 @@ namespace VerifiedIDEAM.Controllers
             if ( !authReq.authOK ) {
                 return null;
             }
-            if (!_cache.TryGetValue( "x509cert", out X509Certificate2 x509cert )) {
-                return null;
-            }
 
             DateTime IssuedAt = DateTime.UtcNow;
             DateTime unixEpoch = new DateTime( 1970, 1, 1 );
             Int32 IssuedAtUnix = (Int32)(IssuedAt.Subtract( unixEpoch )).TotalSeconds;
             Int32 vcExpiry = (Int32)(authReq.vcExpirationDate.Subtract( unixEpoch)).TotalSeconds;
 
-            // for Azure AppServices, the Plan must atleast be Basic and you must add a app config key=WEBSITE_LOAD_CERTIFICATES value=...anything...
-            X509SigningCredentials x509SigningCredentials = new X509SigningCredentials( x509cert );
             int IdTokenLifetime = int.Parse( _configuration["OIDC:IdTokenLifetime"] );
-            var payload = new JwtPayload {
+            // Build JWT payload as JSON — signing is done remotely via Key Vault (no X.509 cert needed)
+            var payloadObj = new JObject {
                 { "iss", GetIssuerEndpoint( authReq.tenantId ) },
                 { "iat", IssuedAtUnix },
                 { "nbf", IssuedAtUnix },
@@ -110,35 +106,35 @@ namespace VerifiedIDEAM.Controllers
                 { "matchConfidenceScore", authReq.matchConfidenceScore },
                 { "vc_exp", vcExpiry },
                 { "acr", "possessionorinherence" },
-                { "amr", new[] {"face" } }
+                { "amr", new JArray("face") }
             };
-            var idToken = new JwtSecurityToken( new JwtHeader( x509SigningCredentials ), payload );
-            var tokenHandler = new JwtSecurityTokenHandler();
-            var token = tokenHandler.WriteToken( idToken );
+            string token = KeyVaultHelper.SignPayload( _configuration, payloadObj.ToString( Newtonsoft.Json.Formatting.None ) );
             return token;
         }
-        private Microsoft.IdentityModel.Tokens.JsonWebKey GetJsonWebKeyFromX509Certificate( X509Certificate2 cert ) {
-            X509SecurityKey x509Key = new X509SecurityKey( cert );
-            if (x509Key.PublicKey is RSA rsa) {
-                Microsoft.IdentityModel.Tokens.JsonWebKey rsaJsonWebKey = JsonWebKeyConverter.ConvertFromX509SecurityKey( x509Key );
-                var thumbprint = VerifiedIDEam.Helpers.Base64Url.Encode( x509Key.Certificate.GetCertHash() );
-                var parameters = rsa.ExportParameters( false );
-                var exponent = VerifiedIDEam.Helpers.Base64Url.Encode( parameters.Exponent );
-                var modulus = VerifiedIDEam.Helpers.Base64Url.Encode( parameters.Modulus );
-                rsaJsonWebKey.N = modulus;
-                rsaJsonWebKey.E = exponent;
-                rsaJsonWebKey.X5t = thumbprint;
-                return rsaJsonWebKey;
+        /// <summary>
+        /// Gets the JWK from Key Vault using KeyClient + CertificateClient.
+        /// Uses KeyClient for public RSA params, CertificateClient for x5c (public cert only).
+        /// Works on Free/Shared App Service plans — no private key is loaded.
+        /// </summary>
+        private (string kid, string e, string n, string x5t, string x5c) GetJsonWebKeyFromKeyVault() {
+            if (_cache.TryGetValue( "kvPublicKey", out (string kid, string e, string n, string x5t, string x5c) cached )) {
+                return cached;
             }
-            return null;
-        }
-        private Microsoft.IdentityModel.Tokens.JsonWebKey GetJsonWebKeyFromKeyVault( ) {
-            X509Certificate2 x509cert = null;
-            if (!_cache.TryGetValue( "x509cert", out x509cert )) {
-                x509cert = KeyVaultHelper.GetKeyVaultX509Certificate( _configuration, out string certName, out string certVersion );
-                _cache.Set( "x509cert", x509cert, TimeSpan.FromHours( 12 ) );
-            }
-            return GetJsonWebKeyFromX509Certificate( x509cert );
+            var kvKey = KeyVaultHelper.GetKeyVaultPublicKey( _configuration, out string keyName, out string keyVersion );
+            var rsaParams = kvKey.Key.ToRSA().ExportParameters( false );
+            // Get public certificate for x5c
+            byte[] certBytes = KeyVaultHelper.GetPublicCertificate( _configuration );
+            string x5cValue = certBytes != null ? System.Convert.ToBase64String( certBytes ) : null;
+            string x5tValue = certBytes != null ? VerifiedIDEam.Helpers.Base64Url.Encode( System.Security.Cryptography.SHA1.Create().ComputeHash( certBytes ) ) : null;
+            var result = (
+                kid: keyVersion,
+                e: VerifiedIDEam.Helpers.Base64Url.Encode( rsaParams.Exponent ),
+                n: VerifiedIDEam.Helpers.Base64Url.Encode( rsaParams.Modulus ),
+                x5t: x5tValue,
+                x5c: x5cValue
+            );
+            _cache.Set( "kvPublicKey", result, TimeSpan.FromHours( 12 ) );
+            return result;
         }
 
         protected bool IsMobile() {
@@ -217,13 +213,13 @@ namespace VerifiedIDEAM.Controllers
                 keys = new[]
                 {
                     new   {
-                        kty = jwkKV.Kty,
+                        kty = "RSA",
                         use = "sig",
-                        kid = jwkKV.KeyId,
-                        x5t = jwkKV.X5t,
-                        e = jwkKV.E,
-                        n = jwkKV.N,
-                        x5c = new[] { jwkKV.X5c[0] }
+                        kid = jwkKV.kid,
+                        x5t = jwkKV.x5t,
+                        e = jwkKV.e,
+                        n = jwkKV.n,
+                        x5c = new[] { jwkKV.x5c }
                     }
                 }
             };
@@ -246,8 +242,12 @@ namespace VerifiedIDEAM.Controllers
             authReq.endpoint = GetRemoteHostName();
 
             bool localTest = false;
-            // only support test in dev mode for ease of testing locally
+            // Allow GET without parameters (Entra validation probe), reject GET with parameters in production
             if ("GET" == this.Request.Method && !_env.IsDevelopment()) {
+                if (!this.Request.QueryString.HasValue) {
+                    // Entra may probe the authorization_endpoint with a GET to validate it
+                    return Ok( new { status = "ready" } );
+                }
                 return ReturnErrorMessage( "IDP011", $"Method GET not supported" );
             }
             if ("POST" == this.Request.Method) {
@@ -441,38 +441,24 @@ namespace VerifiedIDEAM.Controllers
             authReq.idtSub ="sub";
             authReq.authOK = true;
 
-            Microsoft.IdentityModel.Tokens.JsonWebKey jwk = GetJsonWebKeyFromKeyVault();
+            var jwkKV = GetJsonWebKeyFromKeyVault();
             string idToken = GenerateIdToken( authReq );
 
             bool ok = false;
             var tokenHandler = new JwtSecurityTokenHandler();
-            try {
-                tokenHandler.ValidateToken( idToken, new TokenValidationParameters {
-                    ValidateIssuerSigningKey = true,
-                    IssuerSigningKey = jwk,
-                    ValidateIssuer = true,
-                    ValidIssuer = GetIssuerEndpoint( tenantId ),
-                    ValidateAudience = false,
-                    ValidateLifetime = false, // we will get an near expired or an expired id_token from Entra
-                    ClockSkew = TimeSpan.Zero // tokens expires on the exact second
-                }, out SecurityToken validatedToken );
-                //var jwtToken = (JwtSecurityToken)validatedToken;
-                ok = true;
-            } catch (Exception ex) {
-                _log.LogTrace( ex.Message );
-            }
 
+            // Build a JWK from the Key Vault public key for validation
             var rsaJsonWebKey = new {
                 keys = new[]
                 {
                     new   {
-                        kty = jwk.Kty,
+                        kty = "RSA",
                         use = "sig",
-                        kid = jwk.KeyId,
-                        x5t = jwk.X5t,
-                        e = jwk.E,
-                        n = jwk.N,
-                        x5c = new[] { VerifiedIDEam.Helpers.Base64Url.UrlEncode( jwk.X5c[0] ) }
+                        kid = jwkKV.kid,
+                        x5t = jwkKV.x5t,
+                        e = jwkKV.e,
+                        n = jwkKV.n,
+                        x5c = new[] { jwkKV.x5c }
                     }
                 }
             };
@@ -480,6 +466,7 @@ namespace VerifiedIDEAM.Controllers
                 NullValueHandling = NullValueHandling.Ignore
             } );
             JObject jwksConfig = JObject.Parse( resp );
+            Microsoft.IdentityModel.Tokens.JsonWebKey jwk = null;
             foreach (var key in jwksConfig["keys"]) {
                 jwk = JsonConvert.DeserializeObject<Microsoft.IdentityModel.Tokens.JsonWebKey>( JsonConvert.SerializeObject( key ) );
             }
@@ -490,10 +477,9 @@ namespace VerifiedIDEAM.Controllers
                     ValidateIssuer = true,
                     ValidIssuer = GetIssuerEndpoint( tenantId ),
                     ValidateAudience = false,
-                    ValidateLifetime = false, // we will get an near expired or an expired id_token from Entra
-                    ClockSkew = TimeSpan.Zero // tokens expires on the exact second
+                    ValidateLifetime = false,
+                    ClockSkew = TimeSpan.Zero
                 }, out SecurityToken validatedToken );
-                //var jwtToken = (JwtSecurityToken)validatedToken;
                 ok = true;
             } catch (Exception ex) {
                 _log.LogTrace( ex.Message );
